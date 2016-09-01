@@ -7,12 +7,24 @@ from gym.spaces import Discrete, Box
 
 import matplotlib.pyplot as plt
 import gym
+
+from SimpleEnv import SimpleGym
 #import tf.contrib.distributions as dist
 
 f = tf.nn.tanh
 matmul = tf.matmul
 
-def mlp(x, hidden_spec):
+#def log_density_expr(self, means, stdevs, x, name=None):
+    #"""Log density of diagonal gauss"""
+    #with tf.op_scope([means, stdevs, x], name, 'gauss_log_density') as scope:
+        #D = tf.shape(means)[len(means.get_shape()) - 1]
+        #lognormconsts = -.5 * tf.to_float(D) * np.log(2. * np.pi) + 2. * tf.reduce_sum(
+            #tf.log(stdevs), -1)  # log norm consts
+        #logprobs = tf.add(-.5 * tf.reduce_sum(tf.square((x - means) / stdevs), -1),
+                          #lognormconsts, name=scope)
+    #return logprobs
+
+def mlp(x, hidden_spec, f= tf.nn.tanh):
     layer = x
     h_prev= x.get_shape()[-1]
     for i, h in enumerate(hidden_spec):
@@ -91,8 +103,14 @@ class SimpleAdvantage(Advantage):
         self.baseline = SimpleBaseline()
     
     def fit(self, tbatch):
-        obs_B_T_Do, act_B_T_Da, rew_B_T = tbatch.unpack()
-        self.baseline.fit(rew_B_T)
+        obs_B_T_Do, _, rew_B_T = tbatch.unpack()
+        B, T = rew_B_T.shape
+        
+        discounts = np.ones(T,) * self.discount
+        discounts **= np.arange(0,T)
+        A_B_T = np.cumsum(rew_B_T[:,::-1],axis=1)[:,::-1] * discounts
+        
+        self.baseline.fit(A_B_T)
         
         halt= True
         
@@ -101,10 +119,24 @@ class SimpleAdvantage(Advantage):
         B, T = rew_B_T.shape
         
         discounts = np.ones(T,) * self.discount
-        A_B_T = np.cumsum(rew_B_T,axis=1) \
-            * (discounts ** np.arange(0,T)) \
-            - self.baseline.predict(obs_B_T_Do)
+        discounts **= np.arange(0,T)
+        
+        dR_B_T = generate_discounted_returns(rew_B_T, self.discount)
+
+        A_B_T = dR_B_T - self.baseline.predict(obs_B_T_Do)
         return A_B_T
+    
+def generate_discounted_returns(rew_B_T, discount):
+    B, T = rew_B_T.shape
+    
+    discounts = np.ones(T,) * discount
+    discounts **= np.arange(0,T)
+    
+    dR_B_T = np.column_stack(
+        [(rew_B_T* np.roll(discounts,t))[:,t:].sum(axis= 1) for t in range(T)]
+        )
+
+    return dR_B_T
     
 
 class TrajBatch(object):
@@ -137,6 +169,7 @@ def sample_trajs(policy,env,episodes=None,timesteps=None,render=False):
                 done= True
             
             o = o_.copy()
+            assert o.ndim == 1
             
             obs_T.append(o)
             act_T.append(a)
@@ -154,9 +187,9 @@ def sample_trajs(policy,env,episodes=None,timesteps=None,render=False):
         r_B_T.append(
             np.array(r_T)
         )
-    obs_B_T_Do=np.array(obs_B_T)
-    act_B_T_Da=np.array(act_B_T)
-    rew_B_T= np.array(r_B_T)
+    obs_B_T_Do=np.array(obs_B_T).astype('float32')
+    act_B_T_Da=np.array(act_B_T).astype('float32')
+    rew_B_T= np.array(r_B_T).astype('float32')
     
     return TrajBatch(obs_B_T_Do, act_B_T_Da, rew_B_T)
             
@@ -177,12 +210,13 @@ class RandomPolicy(Policy):
         raise NotImplementedError
 
 class GaussianPolicy(Policy):
-    def __init__(self, env, adv, B, T, hidden_spec, normalize= True):
+    def __init__(self, env, adv, B, T, hidden_spec, epsilon, normalize= True):
         self.sess = tf.Session()
         
         #environment variables
         self.env = env
         self.adv = adv
+        self.epsilon = epsilon
         
         self.B, self.T = B, T
         self.Do = Do = get_dim(env.observation_space)
@@ -199,7 +233,7 @@ class GaussianPolicy(Policy):
             x = tf.contrib.layers.batch_norm(self.o_input,
                                              trainable= False)
         else:
-            x = tf.o_input        
+            x = self.o_input        
                 
         #Architecture
         with tf.variable_scope('encoder'):
@@ -208,24 +242,32 @@ class GaussianPolicy(Policy):
         with tf.variable_scope('policy'):
             w = tf.get_variable('w_out',shape=(Dh,Da),initializer=xavier())
             b = tf.get_variable('b_out',shape=(Da,))
-            self.mu = mu = tf.nn.xw_plus_b(h,w,b)
-            
-            #self.logstd = tf.get_variable('logstd', shape=(2,))
-            #self.mu, self.logstd = tf.split(1,2,self.logits)
+            self.mu = mu = tf.nn.tanh(tf.nn.xw_plus_b(h,w,b)) * self.env.action_space.high
             
         #Probability
-        #self.std = tf.maximum(tf.exp(self.logstd),1.)
         self.dist = \
-            tf.contrib.distributions.MultivariateNormalDiag(self.mu, self.std_input)
+            tf.contrib.distributions.Normal(self.mu, self.std_input)
+            #tf.contrib.distributions.MultivariateNormalDiag(self.mu, self.std_input)
+        #self.dist = log_density_expr(self, self.mu, self.std_input, self.a_input)
         
         #Training
-        LL = self.dist.log_pdf(self.a_input)
-        LL_B_T = tf.reshape(LL, (self.B,self.T))
+        self.lps = LL_BT = self.dist.log_pdf(self.a_input)
+        self.act_B_T= tf.reshape(self.a_input,(self.B,self.T,1)) #for debugging purposes
+        
+        LL_B_T = tf.squeeze(tf.reshape(LL_BT,(self.B,self.T,1)))
         A_B_T = self.adv_input
         
-        self.obj = tf.reduce_mean(
-            tf.reduce_sum(LL_B_T * A_B_T,1)
-            )
+        ## Gradient magnitudes go to 0...
+        #self.obj = tf.reduce_mean(
+            #tf.reduce_sum(
+                #LL_B_T * A_B_T, reduction_indices= 1
+                #)
+            #)
+        #self.obj = tf.reduce_mean(
+            #LL_B_T * A_B_T
+            #)
+        self.loss = tf.reduce_mean(
+        )
         
         #gradients
         self.params_and_grads= {}
@@ -239,22 +281,29 @@ class GaussianPolicy(Policy):
     def act(self, o):
         if o.ndim == 1:
             o = o[None,...]
-        elif o.ndim == 3:
-            o = np.reshape(a, (self.B*self.T,self.Do))
+        #elif o.ndim == 3:
+            #o = np.reshape(a, (self.B*self.T,self.Do))
         assert o.ndim == 2
         
-        std = np.ones((1,1)) * 0.65
+        std = np.ones((1,1)) * self.epsilon
         feed = {self.o_input: o,
                 self.std_input: std}
         mu,  = self.sess.run(self.mu, 
                                feed_dict= feed)
         
-        action = np.random.normal(mu,std)
+        action = np.clip(np.random.normal(mu,std),
+                         self.env.action_space.low,
+                         self.env.action_space.high)
+        
         assert not np.isnan(action)
-        return np.array([action])
+        assert hasattr(action,'shape')
+        return np.array(action)
     
-    def fit(self, epochs, lr=1e-10, render= False):
+    def fit(self, epochs, lr=1e-3, render= False):
         avg_return= []
+        avg_obj = []
+        sgd = tf.train.GradientDescentOptimizer(-1 * lr)
+        
         for epoch in range(epochs):
             print "epoch: %i of %i"%(epoch,epochs)
             tbatch = sample_trajs(self,env)
@@ -266,40 +315,61 @@ class GaussianPolicy(Policy):
             adv_B_T = self.adv.predict(tbatch)
                         
             #Collapse timesteps into batch size:
-            obs_B_T = np.reshape(obs_B_T_Do, (-1,obs_B_T_Do.shape[-1]))
-            act_B_T = np.reshape(act_B_T_Da, (-1,act_B_T_Da.shape[-1]))
+            obs_BT_Do = np.reshape(obs_B_T_Do, (-1,obs_B_T_Do.shape[-1]))
+            act_BT_Da = np.reshape(act_B_T_Da, (-1,act_B_T_Da.shape[-1]))
+            
+            assert act_BT_Da.max() <= self.env.action_space.high
+            assert act_BT_Da.min() >= self.env.action_space.low
             
             #Update policy
-            feed = {self.o_input: obs_B_T,
-                    self.a_input: act_B_T,
+            feed = {self.o_input: obs_BT_Do,
+                    self.a_input: act_BT_Da,
                     self.adv_input: adv_B_T,
-                    self.std_input: np.ones_like(act_B_T) * 0.65}
-            
-            ops= []
-            for param, grad in self.params_and_grads.items():
-                param_ = param.assign_add(lr * grad)
-                ops.append( param.assign(param_) )
+                    self.std_input: np.ones_like(act_BT_Da) * self.epsilon,}
                 
             #Report results
-            _, grads = self.sess.run([ops,self.params_and_grads.values()],feed)
-            for grad in grads:
+            weights = self.sess.run(self.params_and_grads.keys())
+            _, obj, mu, lps, act_B_T_Da_new, gvs = self.sess.run([sgd.minimize(self.obj),
+                                           self.obj,
+                                           self.mu,
+                                           self.lps,
+                                           self.act_B_T,
+                                           sgd.compute_gradients(self.obj)],feed)
+            
+            assert (act_B_T_Da == act_B_T_Da_new).all()
+                       
+            weights_= self.sess.run(self.params_and_grads.keys())
+            for w, w_ in zip(weights,weights_):
+                print "change in weight: %f"%np.linalg.norm(w - w_)
+            for grad, var in gvs:
                 print 'gradient magnitude: %f'%(np.linalg.norm(grad))
-            avg_return.append(np.mean(rew_B_T.sum(axis=1)))                
+            avg_return.append(np.mean(rew_B_T.sum(axis=1)))
+            avg_obj.append(obj)
+            print "obj: %f"%obj
             print "Average Return: %f"%avg_return[-1]
             
             if render:
                 sample_trajs(self,env,episodes=1,
                              render= True)
-        plt.plot(avg_return)
+                
+        _, ax = plt.subplots(1,1)
+        ax.plot(avg_return, 'b')
+        ax.plot(avg_obj, 'r')
         plt.show()
         
         halt= True
                 
-env = gym.make('Pendulum-v0')
-adv = SimpleAdvantage(0.97)
-policy = GaussianPolicy(env, adv, B=350,T=500,hidden_spec=[15,5])
-policy.fit(1000, lr= 1e-6, render=True)
-            
+#env = gym.make('Pendulum-v0')
+env = SimpleGym()
+adv = SimpleAdvantage(.97)
+policy = GaussianPolicy(env, adv, B=25,T=50,hidden_spec=[5],epsilon=0.4,
+                        normalize=True)
+policy.fit(50, lr= 1e-4, render= False)
+
+#policy = RandomPolicy(env, adv, B=1, T=100, hidden_spec=[])
+#while True:
+    #sample_trajs(policy,env,episodes=1,render= True)
+
     
 #class TrajBatch(object):
     #def __init__(self, batch_size):
