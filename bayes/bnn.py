@@ -7,49 +7,46 @@ from matplotlib import pyplot as plt
 
 import data
 from data.visualization import Visualizer
+    
+def flatten(t):
+    flat_dim = np.prod(t.get_shape().as_list())
+    return tf.reshape(t, (-1, flat_dim))
 
-"""
-Works after about 5000 epochs.
-"""
+def kl_divergence(W_post):
+    """
+    Computes the (approximate) kl divergence between a multivariable, diagonal gaussian
+    and standard normal gaussian.
+    
+    W_post (tensor): mean and rho values for posterior weight matrix, concatenated along axis 1.
+    """
+    mu, rho = tf.split(1,2,W_post)
+    sig = tf.log(1.0 + tf.exp(rho)) # stdev must be positive.
+    mu, sig = flatten(mu), flatten(sig)   
+    
+    posterior = tf.contrib.distributions.MultivariateNormalDiag(
+        mu, sig, name="posterior")
+    prior = tf.contrib.distributions.MultivariateNormalDiag(
+        tf.zeros_like(mu),tf.ones_like(sig),name="prior")
 
-#N = 1000; V= int(N * 0.7); M= 2; H= 5*M; O= 1
-#sig= 0.2; EPOCHS= 10000
-#X, Y = data.pringle(N,M,sig)
-    
-def gauss_ll(params, v_params= None):
-    if v_params is None:
-        mu= {name : tf.constant(np.zeros(tensor.get_shape()[1:]).astype('float32')) for name, tensor in params.items()}
-        std= {name : tf.constant(np.ones(tensor.get_shape()[1:]).astype('float32')) for name, tensor in params.items()}
-        v_params= {'mu':mu,'std':std}
-    
-    logprobs= []
-    #For each network param (w1, b1, w2, b2) 
-    for name, tensor in params.items():
-        mu = tf.reshape(v_params['mu'][name], (np.prod(v_params['mu'][name].get_shape()).value,))
-        std= tf.reshape(v_params['std'][name],(np.prod(v_params['std'][name].get_shape()).value,))
-        gaussian = tf.contrib.distributions.MultivariateNormalDiag(mu, std)
-        lps=[]
-        #For each sample in the batch of "variational posteriors" weights. E~q(w|theta)
-        for k in range(tensor.get_shape()[0].value):
-            row= tensor[k,:,:]
-            v= tf.reshape(row, (np.prod(row.get_shape()).value,))
-            lp= gaussian.log_prob(v)
-            
-            lps.append(lp)
-        logprobs.append(tf.reduce_mean(lps))
-    
-    return tf.reduce_sum(logprobs) ##Doesn't seem to matter...
-    #return tf.reduce_mean(logprobs)
+    return posterior.log_pdf(posterior.sample()) - prior.log_pdf(posterior.sample())
   
 class NNet():
-    def __init__(self, vis, i_dim, h_dim, o_dim, f= tf.nn.tanh, bayes= False):
+    """
+    implements two-layer neural networks in both bayesian and deterministic flavors.
+    i_dim : input dimensionality
+    h_dim : hidden layer dimensionality
+    o_dim : output layer dimensionality
+    f : activation function
+    bayes : boolean flag to indicate weight uncertainty
+    """
+    def __init__(self, vis, i_dim, h_dim, o_dim, f= tf.nn.tanh, bayes= True,
+                 batch_size= 10, learning_rate= 1e-2, reg= 0.0):
         self.sess = tf.Session()
         self.bayes= bayes
         self.vis = vis
         
         #Define batch sizes for true data and noise samples.
-        self.data_bs = 10
-        self.weight_bs= 5        
+        self.data_bs = batch_size       
         
         with tf.variable_scope('inputs'):
             self.x_input=x= tf.placeholder(tf.float32, shape=(None,i_dim), name='x_input')
@@ -59,63 +56,43 @@ class NNet():
                 #used to weight KL-divergence (regularization) term during minibatch learning.
                 self.complexity_weight= tf.placeholder(dtype=tf.float32, shape=(), name='c_weight')
                 
-                #Define mu for each weight
-                w1_mu = tf.get_variable('w1_mu', shape=(i_dim,h_dim), dtype=tf.float32)
-                b1_mu = tf.get_variable('b1_mu',shape=(h_dim,), dtype=tf.float32)
-                w2_mu = tf.get_variable('w2_mu',shape= (h_dim,o_dim),dtype=tf.float32)
-                b2_mu = tf.get_variable('b2_mu',shape=(o_dim,), dtype=tf.float32)
+                # tunable mu and std parameter weight matrices
+                w1_param = tf.get_variable('w1', shape=(i_dim,h_dim * 2), dtype=tf.float32)
+                w2_param = tf.get_variable('w2',shape= (h_dim,o_dim * 2),dtype=tf.float32)
                 
-                #Define "rho" for each weight
-                w1_rho = tf.get_variable('w1_rho', shape=(i_dim,h_dim), dtype=tf.float32)
-                b1_rho = tf.get_variable('b1_rho',shape=(h_dim,), dtype=tf.float32)            
-                w2_rho = tf.get_variable('w2_rho',shape= (h_dim,o_dim),dtype=tf.float32)
-                b2_rho = tf.get_variable('b2_rho',shape=(o_dim,), dtype=tf.float32)                
+                def reparam(t):
+                    """
+                    can't backprop through stochastic weights.
+                    employs reparameterization trick.
+                    """
+                    mu, rho = tf.split(1,2,t)
+                    sig = tf.log(1.0 + tf.exp(rho)) # stdev must be positive
+                    return mu + sig * tf.random_normal(sig.get_shape())
                 
-                #Define std for each weight (function of rho, ensuring stds are positive)
-                w1_std = tf.add(1., tf.exp(w1_rho), name= 'w1_std')
-                b1_std = tf.add(1., tf.exp(b1_rho), name= 'b1_std')
-                w2_std = tf.add(1., tf.exp(w2_rho), name= 'w2_std')
-                b2_std = tf.add(1., tf.exp(b2_rho), name= 'b2_std')                 
+                # stochastic weight matrices
+                w1 = reparam(w1_param)
+                w2 = reparam(w2_param)
                 
-                #placeholders for parameter-free noise samples.
-                w1_e = tf.placeholder(name='w1_e', shape=(self.weight_bs,i_dim,h_dim), dtype=tf.float32)
-                b1_e = tf.placeholder(name='b1_e',shape=(self.weight_bs,1,h_dim,), dtype=tf.float32)
-                w2_e = tf.placeholder(name='w2_e',shape= (self.weight_bs,h_dim,o_dim),dtype=tf.float32)
-                b2_e = tf.placeholder(name='b2_e',shape=(self.weight_bs,1,o_dim,), dtype=tf.float32)
-                self.samples = {'w1':w1_e,'w2':w2_e,'b1':b1_e,'b2':b2_e}
-                
-                #variational parameters (i.e., the trainable params in bayesian inference)
-                self.v_params= {'mu':{'w1':w1_mu,'w2':w2_mu,'b1':b1_mu,'b2':b2_mu},
-                                   'std':{'w1':w1_std,'w2':w2_std,'b1':b1_std,'b2':b2_std}}                
-                
-                #reparameterization trick! (scale noise with std, translate with mean)
-                w1= tf.add(w1_mu, w1_std * w1_e,name='w1')
-                b1= tf.add(b1_mu, b1_std * b1_e,name='b1')
-                w2= tf.add(w2_mu, w2_std * w2_e,name='w2')
-                b2= tf.add(b2_mu, b2_std * b2_e,name='b2')
             else:
-                #define network weights
+                # deterministic weight matrices
                 w1 = tf.get_variable('w1', shape=(i_dim,h_dim), dtype=tf.float32)
-                b1 = tf.get_variable('b1',shape=(h_dim,), dtype=tf.float32)
                 w2 = tf.get_variable('w2',shape= (h_dim,o_dim),dtype=tf.float32)
-                b2 = tf.get_variable('b2',shape=(o_dim,), dtype=tf.float32)                
+                
+            b1 = tf.get_variable('b1',shape=(h_dim,), dtype=tf.float32)
+            b2 = tf.get_variable('b2',shape=(o_dim,), dtype=tf.float32)                
                 
             self.params = {'w1':w1,'w2':w2,'b1':b1,'b2':b2}            
                
         with tf.variable_scope('training'):
             if self.bayes:
-                #Repeat x and y, because each epoch we train a different network on the data.
-                x = tf.tile(tf.expand_dims(x,0), (self.weight_bs,1,1))
-                y = tf.tile(tf.expand_dims(y,0), (self.weight_bs,1,1))
-                matmul = tf.batch_matmul #Need batch matmul because both data AND noise come in batches.
-                complexity_term = self.complexity_weight *\
-                    (gauss_ll(self.params, v_params=self.v_params)-gauss_ll(self.params))
+                c1 = kl_divergence(w1_param)
+                c2 = kl_divergence(w2_param)
+                complexity_term = self.complexity_weight * tf.reduce_sum([c1,c2])
             else:
-                matmul = tf.matmul
-                complexity_term= 0.0
+                complexity_term = reg * tf.reduce_sum([tf.nn.l2_loss(w1),tf.nn.l2_loss(w2)])
                 
             #Define network/model architecture
-            self.model=y_pred= matmul(f(matmul(x,w1)+b1),w2)+b2
+            self.model=y_pred= tf.matmul(f(tf.matmul(x,w1)+b1),w2)+b2
             
             #Maximum likelihood cost component (reduces to l2 norm for Gaussians)
             likelihood_term = tf.reduce_mean(tf.reduce_mean((y - y_pred) ** 2,reduction_indices= 0))
@@ -124,16 +101,25 @@ class NNet():
             self.cost = likelihood_term + complexity_term
             
             #TensorFlow optimizers
-            self.adam= tf.train.AdamOptimizer()
+            self.adam= tf.train.AdamOptimizer(learning_rate=learning_rate)
             self.opt = self.adam.minimize(self.cost)
 
         self.sess.run(tf.initialize_all_variables())
             
     def fit(self,X_t,Y_t,X_v,Y_v,epochs=100):
+        """
+        minibatch gradient descent.
+        
+        X_t, Y_t : training set and labels
+        X_v, Y_v : validation set and labs
+        epochs : number of epochs
+        """
         N = X_t.shape[0]
         M = int(N/self.data_bs)
         
-        feed_v = {self.x_input: X_v, self.y_input: Y_v, self.complexity_weight: 1.}        
+        feed_v = {self.x_input: X_v, self.y_input: Y_v}
+        if self.bayes:
+            feed_v.update({self.complexity_weight: 0.})
         
         for epoch in range(epochs):
             print "Epoch: %i"%epoch
@@ -149,43 +135,41 @@ class NNet():
                 
                 feed_t = {self.x_input: X_batch, self.y_input: Y_batch}
                 if self.bayes:
-                    # inject noise to perform Stochastic Gradient Variational Bayes
-                    feed_samples= {tensor: np.random.normal(0,1,tensor.get_shape())\
-                                   for _, tensor in self.samples.items()}
-        
                     pi = (2. ** (M-i))/(2.**M - 1.)
-                    feed_t.update(feed_samples)
                     feed_t.update({self.complexity_weight:pi})
-                    feed_v.update(feed_samples)
                 
                 loss_t, _ = self.sess.run([self.cost, self.opt],feed_t)
                 losses_t.append(loss_t)
             
-            loss_v = self.sess.run([self.cost], feed_v)
+            loss_t = np.mean(losses_t)
+            loss_v = self.sess.run(self.cost, feed_v)
             
-            print "Average Loss: %f"%np.mean(losses_t)
+            print "Train Loss: {} == Valid. Loss: {}".format(loss_t,loss_v)
             
             self.vis.display_loss(np.mean(losses_t), loss_v)
             
-            Y_p = self.predict(X_v)            
-            self.vis.display_data(X_v, Y_p, epoch)
+            Y_p, Y_std = self.predict(X_v)
+            self.vis.display_data(epoch, X_v, Y_p, Y_std)
                 
-    
-    def predict(self,X, n= 100):
-        feed = {self.x_input:X}
+    def predict(self, X, n = 100):
+        """
+        Output predictions on input data X.
+        
+        if bayesian, sample n predictions and return mean and stdev.
+        """
         if self.bayes:
-            feed_samples= {tensor: np.random.normal(0,1,tensor.get_shape())\
-                           for name, tensor in self.samples.items()}
-            feed.update(feed_samples)
-            predictions = self.sess.run(self.model, feed)
-            
-            #Retrieve mu and std
-            mu= self.sess.run(self.v_params['mu'].values())
-            std=self.sess.run(self.v_params['std'].values())
-            
-            return predictions
-                        
-        else:
-            prediction= self.sess.run(self.model, feed)
+            preds = []
+            for _ in xrange(n):
+                preds.append(self._predict(X))
                 
-            return prediction
+            prediction = np.mean(preds, axis = 0)
+            confidence = np.std(preds, axis = 0)
+        else:
+            prediction = self._predict(X)
+            confidence = None
+            
+        return prediction, confidence
+    
+    def _predict(self, X):
+        feed = {self.x_input:X}
+        return self.sess.run(self.model, feed)
